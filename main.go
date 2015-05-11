@@ -1,174 +1,172 @@
 package main
 
 import (
+	"encoding/binary"
+	"errors"
 	"fmt"
+	"github.com/xbreezes/go-socks5/utils"
+	"io"
+	"log"
 	"net"
+	"strconv"
 	"time"
+)
+
+const (
+	socksVer5       = 0x05
+	socksCmdConnect = 0x01
 )
 
 var (
 	Commands = []string{"CONNECT", "BIND", "UDP ASSOCIATE"}
 	AddrType = []string{"", "IPv4", "", "Domain", "IPv6"}
 	Conns    = make([]net.Conn, 0)
+
+	errAddrType      = errors.New("socks addr type not supported")
+	errVer           = errors.New("socks version not supported")
+	errMethod        = errors.New("socks only support noauth method")
+	errAuthExtraData = errors.New("socks authentication get extra data")
+	errReqExtraData  = errors.New("socks request get extra data")
+	errCmd           = errors.New("socks only support connect command")
 )
 
-func handleSocks4(conn net.Conn, buf []byte) {
-	rep := make([]byte, 512)
-	rep[0] = 0x05
-	rep[1] = 0xFF //协议不兼容
-	conn.Write(rep[0:2])
-}
+func handShake(conn net.Conn) (err error) {
+	const (
+		idVer     = 0
+		idNmethod = 1
+	)
 
-func handleSocks5(conn net.Conn, buf []byte) {
-	rep := make([]byte, 512)
+	buf := make([]byte, 258)
 
-	fmt.Println("Method Count:", buf[1])
-	fmt.Print("Methods:")
+	var n int
 
-	supportNP := false
-
-	for _, m := range buf[2 : 2+buf[1]] {
-		if m == 0x02 {
-			supportNP = true
-		}
-		fmt.Printf("%x,", m)
-	}
-	fmt.Println()
-
-	if !supportNP {
-		rep[0] = 0x05
-		rep[1] = 0xFF //协议不兼容
-		conn.Write(rep[0:2])
+	// make sure we get the nmethod field
+	if n, err = io.ReadAtLeast(conn, buf, idNmethod+1); err != nil {
 		return
 	}
-	//协商认证模式
-	rep[0] = 0x05
-	rep[1] = 0x02 // 用户名/密码
-	conn.Write(rep[0:2])
-
-	//获取认证信息
-	_, err := conn.Read(buf)
-	if err != nil {
-		fmt.Println(err)
-		return
+	//验证 Socks 版本
+	if buf[idVer] != socksVer5 {
+		return errVer
 	}
-
-	uname := string(buf[2 : 2+buf[1]])
-	upwd := string(buf[3+buf[1] : 3+buf[1]+buf[3+buf[1]]])
-
-	fmt.Println("UNAME:", uname)
-	fmt.Println("PASSWD:", upwd)
-
-	//反馈验证结果
-	rep[0] = 0x00
-	rep[1] = 0x00 // 成功
-	conn.Write(rep[0:2])
-
-	//协商连接
-	_, err = conn.Read(buf)
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	if buf[1] > 0x03 || buf[1] == 0x00 {
-		fmt.Println("Unknown command")
-		return
-	}
-
-	fmt.Println("Command:", Commands[buf[1]-1])
-
-	// 如果不是TCP Stream 则提示Command 不受支持
-	if buf[1] != 0x01 {
-		rep[0] = 0x05
-		rep[1] = 0x07
-		conn.Write(rep[0:3])
-		return
-	}
-
-	if buf[3] > 0x04 || buf[3] == 0x02 || buf[3] == 0x00 {
-		fmt.Println("Unknown address type")
-		return
-	}
-
-	fmt.Println("AddType:", AddrType[buf[3]], buf[3])
-	pindex := 0
-	rAddr := net.TCPAddr{}
-	rdomain := ""
-	switch int(buf[3]) {
-	case 0x01:
-		pindex = 8
-		rAddr.IP = buf[4:8]
-		rAddr.Zone = "ip4"
-		break
-	case 0x03:
-		pindex = 5 + int(buf[4])
-		rdomain = string(buf[5 : 5+buf[4]])
-		break
-	case 0x04:
-		pindex = 20
-		rAddr.IP = buf[4:20]
-		rAddr.Zone = "ip6"
-		break
-	}
-	rport := int(buf[pindex])<<8 | int(buf[pindex+1])
-	if rport == 0 {
-		rport = 80
-	}
-	var remote string
-	if rdomain != "" { // domain
-		fmt.Println("Domain:", rdomain)
-		nip, err := net.LookupIP(rdomain)
-		if err != nil {
-			fmt.Println(err)
-			rep[0] = 0x05
-			rep[1] = 0x03 //网络不通
-			conn.Write(rep[0:2])
+	nmethod := int(buf[idNmethod]) //客户端支持的认证模式数量
+	msgLen := nmethod + 2          //认证数据长度
+	if n == msgLen {               // handshake done, common case //已读取完所有认证数据
+		// do nothing, jump directly to send confirmation
+	} else if n < msgLen { // has more methods to read, rare case //读取剩余的所有认证数据
+		if _, err = io.ReadFull(conn, buf[n:msgLen]); err != nil {
 			return
 		}
-		if len(nip) < 0 {
-			rep[0] = 0x05
-			rep[1] = 0x04 //域名不能解析
-			conn.Write(rep[0:2])
-			fmt.Println("Cannt loopip for domain:", rdomain)
-		}
-		fmt.Println("NSLookup:")
-		for _, i := range nip {
-			mip, _ := net.IP(i).MarshalText()
-			fmt.Println(string(mip))
-		}
-		rAddr.IP = nip[0]
-		if rAddr.IP.Equal(rAddr.IP.To4()) {
-			rAddr.Zone = "ip4"
-		} else {
-			rAddr.Zone = "ip6"
-		}
+	} else { // error, should not get extra data
+		return errAuthExtraData
 	}
+	/*
+				  X'00' NO AUTHENTICATION REQUIRED
+		          X'01' GSSAPI
+		          X'02' USERNAME/PASSWORD
+		          X'03' to X'7F' IANA ASSIGNED
+		          X'80' to X'FE' RESERVED FOR PRIVATE METHODS
+		          X'FF' NO ACCEPTABLE METHODS
+	*/
+	// send confirmation: version 5, no authentication required
+	_, err = conn.Write([]byte{socksVer5, 0})
+	return
+}
 
-	var rAddrIp []byte
-	if "ip6" == rAddr.Zone {
-		fmt.Println("ipv6")
-		rAddrIp, _ = rAddr.IP.MarshalText()
-		remote = fmt.Sprintf("[%s]:%d", string(rAddrIp), rport)
-	} else {
-		fmt.Println("ipv4")
-		rAddrIp, _ = rAddr.IP.To4().MarshalText()
-		remote = fmt.Sprintf("%s:%d", string(rAddrIp), rport)
+func parseTarget(conn net.Conn) (host string, err error) {
+	const (
+		idVer   = 0
+		idCmd   = 1
+		idType  = 3 // address type index
+		idIP0   = 4 // ip addres start index
+		idDmLen = 4 // domain address length index
+		idDm0   = 5 // domain address start index
+
+		typeIPv4 = 1 // type is ipv4 address
+		typeDm   = 3 // type is domain address
+		typeIPv6 = 4 // type is ipv6 address
+
+		lenIPv4   = 3 + 1 + net.IPv4len + 2 // 3(ver+cmd+rsv) + 1addrType + ipv4 + 2port
+		lenIPv6   = 3 + 1 + net.IPv6len + 2 // 3(ver+cmd+rsv) + 1addrType + ipv6 + 2port
+		lenDmBase = 3 + 1 + 1 + 2           // 3 + 1addrType + 1addrLen + 2port, plus addrLen
+	)
+	// refer to getRequest in server.go for why set buffer size to 263
+	buf := make([]byte, 263)
+	var n int
+
+	// read till we get possible domain length field
+	if n, err = io.ReadAtLeast(conn, buf, idDmLen+1); err != nil {
+		return
 	}
-
-	fmt.Println("Selected Remote:", remote)
-	fmt.Println("Connect remote...")
-	rcon, err := net.DialTimeout("tcp", remote, time.Duration(time.Second*15))
-	if err != nil {
-		fmt.Println(err)
-		rep[0] = 0x05
-		rep[1] = 0x04
-		conn.Write(rep[0:2])
+	// check version and cmd
+	if buf[idVer] != socksVer5 {
+		err = errVer
+		return
+	}
+	/*
+		CONNECT X'01'
+		BIND X'02'
+		UDP ASSOCIATE X'03'
+	*/
+	//判断连接模式
+	if buf[idCmd] > 0x03 || buf[idCmd] == 0x00 {
+		log.Println("未知 Command", buf[idCmd])
+	}
+	log.Println("Command:", Commands[buf[idCmd]-1])
+	if buf[idCmd] != socksCmdConnect { //仅支持CONNECT模式
+		err = errCmd
 		return
 	}
 
-	defer rcon.Close()
+	//读取代理目标地址
+	reqLen := -1
+	switch buf[idType] {
+	case typeIPv4:
+		reqLen = lenIPv4
+	case typeIPv6:
+		reqLen = lenIPv6
+	case typeDm: //域名
+		reqLen = int(buf[idDmLen]) + lenDmBase
+	default:
+		err = errAddrType
+		return
+	}
 
-	tcpAddr := rcon.LocalAddr().(*net.TCPAddr)
+	if n == reqLen { //已读取所有目标地址信息
+		// common case, do nothing
+	} else if n < reqLen { // rare case // 读取剩余的目标地址信息
+		if _, err = io.ReadFull(conn, buf[n:reqLen]); err != nil {
+			return
+		}
+	} else {
+		err = errReqExtraData
+		return
+	}
+
+	//转化目标地址为可阅读模式
+	switch buf[idType] {
+	case typeIPv4:
+		host = net.IP(buf[idIP0 : idIP0+net.IPv4len]).String()
+	case typeIPv6:
+		host = net.IP(buf[idIP0 : idIP0+net.IPv6len]).String()
+	case typeDm:
+		host = string(buf[idDm0 : idDm0+buf[idDmLen]])
+	}
+	port := binary.BigEndian.Uint16(buf[reqLen-2 : reqLen])
+	host = net.JoinHostPort(host, strconv.Itoa(int(port)))
+
+	return
+}
+
+func pipeWhenClose(conn net.Conn, target string) {
+
+	log.Println("Connect remote ", target, "...")
+	remoteConn, err := net.DialTimeout("tcp", target, time.Duration(time.Second*15))
+	if err != nil {
+		log.Println("Connect remote :", err)
+		return
+	}
+
+	tcpAddr := remoteConn.LocalAddr().(*net.TCPAddr)
 	if tcpAddr.Zone == "" {
 		if tcpAddr.IP.Equal(tcpAddr.IP.To4()) {
 			tcpAddr.Zone = "ip4"
@@ -177,9 +175,9 @@ func handleSocks5(conn net.Conn, buf []byte) {
 		}
 	}
 
-	fmt.Println("Local IP Zone:", tcpAddr.Zone)
-	fmt.Println("Connect remote success @", tcpAddr.String())
+	log.Println("Connect remote success @", tcpAddr.String())
 
+	rep := make([]byte, 256)
 	rep[0] = 0x05
 	rep[1] = 0x00 // success
 	rep[2] = 0x00 //RSV
@@ -197,49 +195,21 @@ func handleSocks5(conn net.Conn, buf []byte) {
 	} else {
 		ip = tcpAddr.IP.To4()
 	}
-	tip, _ := ip.MarshalText()
-	fmt.Println(string(tip))
-	pindex = 4
-	for i, b := range ip {
-		rep[4+i] = b
+	pindex := 4
+	for _, b := range ip {
+		rep[pindex] = b
 		pindex += 1
 	}
 	rep[pindex] = byte((tcpAddr.Port >> 8) & 0xff)
 	rep[pindex+1] = byte(tcpAddr.Port & 0xff)
-
-	bindLocal := fmt.Sprintf("%s:%d", tip, int(rep[pindex])<<8|int(rep[pindex+1]))
-	fmt.Println("Bind:", bindLocal)
-	conn.Write(rep[0 : pindex+3])
+	conn.Write(rep[0 : pindex+2])
 	//传输数据
 
+	defer remoteConn.Close()
 	//Copy本地到远程
-	go func() {
-		inBuf := make([]byte, 40960)
-		for {
-			c, err := conn.Read(inBuf)
-			if err != nil {
-				rcon.Close()
-				fmt.Println("C:", err)
-				break
-			}
-			if c > 0 {
-				rcon.Write(inBuf[0:c])
-			}
-		}
-	}()
-	//Copy本地到远程
-	outBuf := make([]byte, 40960)
-	for {
-		c, err := rcon.Read(outBuf)
-		if err != nil {
-			conn.Close()
-			fmt.Println("S:", err)
-			break
-		}
-		if c > 0 {
-			conn.Write(outBuf[0:c])
-		}
-	}
+	go utils.Copy(conn, remoteConn)
+	//Copy远程到本地
+	utils.Copy(remoteConn, conn)
 }
 
 func handleConnection(conn net.Conn) {
@@ -252,54 +222,43 @@ func handleConnection(conn net.Conn) {
 		}
 		conn.Close()
 	}()
-	buf := make([]byte, 512)
-	rep := make([]byte, 2)
-
-	c, err := conn.Read(buf)
-	if err != nil {
-		fmt.Println(err)
+	if err := handShake(conn); err != nil {
+		log.Println("socks handshake:", err)
 		return
 	}
-	//验证Socks版本
-	fmt.Println("C:", c)
-	fmt.Println("Socks Version:", buf[0])
-	switch buf[0] {
-	case 0x05:
-		handleSocks5(conn, buf)
-	case 0x04:
-		handleSocks4(conn, buf)
-	default:
-		rep[0] = 0x05
-		rep[1] = 0xFF //
-		conn.Write(rep[0:2])
+	addr, err := parseTarget(conn)
+	if err != nil {
+		log.Println("socks consult transfer mode or parse target :", err)
+		return
 	}
+	pipeWhenClose(conn, addr)
 }
 
 func main() {
-	ln, err := net.Listen("tcp", ":7074")
+	ln, err := net.Listen("tcp", ":40000")
 	if err != nil {
-		fmt.Println(err)
+		panic(err)
 		return
 	}
 	go func() {
 		lastC := len(Conns)
-		fmt.Println("Alive Connections:", lastC)
+		log.Println("alive connections:", lastC)
 		for _ = range time.Tick(time.Second) {
 			tc := len(Conns)
 			if tc != lastC {
-				fmt.Println("Alive Connections:", tc)
+				log.Println("alive connections:", tc)
 				lastC = tc
 			}
 		}
 	}()
-	fmt.Println("Start @", ln.Addr())
+	log.Println("Start @", ln.Addr())
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			fmt.Println(err)
 			return
 		}
-		fmt.Println("new client:", conn.RemoteAddr())
+		log.Println("new client:", conn.RemoteAddr())
 		go handleConnection(conn)
 	}
 }
