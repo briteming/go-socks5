@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"github.com/xbreezes/go-socks5/utils"
+	"github.com/briteming/go-socks5/utils"
 	"io"
 	"log"
 	"net"
